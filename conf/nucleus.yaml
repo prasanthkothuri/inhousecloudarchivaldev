@@ -1,0 +1,20 @@
+env: dev
+
+connections:
+  nucleus_dev: nucleus_dev
+
+warehouses: 
+    dev_warehouse: s3://{s3_warehouse_bucket}
+
+retention_policies:
+  default_6m: "6m"
+
+sources:
+  - name: nucleus_dev
+    connection: nucleus_dev
+    include:
+      schemas: ["public"]
+      tables:  ["^sample_submission_.*$"]
+    exclude: {}
+    warehouse: dev_warehouse
+    retention_policy: default_6m
