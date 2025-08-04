@@ -253,7 +253,7 @@ def prepare_glue_job_args(**context):
         "--source_table": table,
         "--glue_connection_name": conn_val,
         "--target_s3_path": s3_path,
-        "--target_glue_db": f"archive_{conn_val}",
+        "--target_glue_db": f"ilm_{conn_val}",
         "--target_glue_table": f"{schema}_{table}",
         "--retention_policy_value": retention_value,
         "--legal_hold": str(legal_hold).lower(),
