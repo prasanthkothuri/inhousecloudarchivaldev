@@ -16,7 +16,7 @@ set -euo pipefail
 
 DB_NAME=${1:-}
 WG_NAME=${2:-primary}
-REGION=${3:-eu-west-2}
+REGION=${3:-eu-west-1}
 
 if [[ -z "$DB_NAME" ]]; then
   echo "Usage: $0 <database_name> [athena_workgroup] [region]"

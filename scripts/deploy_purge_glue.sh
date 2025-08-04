@@ -10,12 +10,12 @@ AWS_REGION="eu-west-1"
 S3_ASSET_BUCKET="natwest-data-archive-assets"
 S3_WAREHOUSE_BUCKET="natwest-data-archive-vault"   # Iceberg warehouse bucket
 
-# Glue assets
-GLUE_JOB_NAME="natwest-data-archive-table-to-iceberg"
-GLUE_ROLE_NAME="natwest-data-archive-glue-role"
+# Glue assets for PURGE job
+GLUE_JOB_NAME="natwest-data-purge-from-iceberg"
+GLUE_ROLE_NAME="natwest-data-archive-glue-role"  # Use existing role
 GLUE_CONNECTION_NAME="onprem_orcl_conn"
-GLUE_SCRIPT_LOCAL_PATH="glue_jobs/archive_table.py"
-GLUE_SCRIPT_S3_KEY="glue_jobs/archive_table.py"
+GLUE_SCRIPT_LOCAL_PATH="glue_jobs/purge_table.py"
+GLUE_SCRIPT_S3_KEY="glue_jobs/purge_table.py"
 GLUE_VERSION="5.0"
 MAX_CONCURRENCY=10
 
@@ -32,122 +32,17 @@ GLUE_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${GLUE_ROLE_NAME}"
 S3_SCRIPT_PATH="s3://${S3_ASSET_BUCKET}/${GLUE_SCRIPT_S3_KEY}"
 
 ###############################################################################
-# IAM role: create / update with least-privilege inline policy
+# Skip IAM role creation - use existing archival role
 ###############################################################################
-echo "Ensuring IAM role ${GLUE_ROLE_NAME} exists ..."
+echo "Using existing IAM role ${GLUE_ROLE_NAME} ..."
 
-# 1. Trust policy
-cat >"$TMP_DIR/trust.json" <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": { "Service": "glue.amazonaws.com" },
-    "Action": "sts:AssumeRole"
-  }]
-}
-EOF
-
+# Verify the role exists
 if ! "${AWS_CMD[@]}" iam get-role --role-name "$GLUE_ROLE_NAME" >/dev/null 2>&1; then
-  "${AWS_CMD[@]}" iam create-role \
-    --role-name "$GLUE_ROLE_NAME" \
-    --assume-role-policy-document "file://$TMP_DIR/trust.json" >/dev/null
-else
-  "${AWS_CMD[@]}" iam update-assume-role-policy \
-    --role-name "$GLUE_ROLE_NAME" \
-    --policy-document "file://$TMP_DIR/trust.json" >/dev/null
+  echo "ERROR: Role ${GLUE_ROLE_NAME} does not exist. Please run deploy_glue.sh for archival first."
+  exit 1
 fi
 
-# 2. Attach managed Glue service-role policy
-"${AWS_CMD[@]}" iam attach-role-policy \
-  --role-name "$GLUE_ROLE_NAME" \
-  --policy-arn "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole" >/dev/null
-
-# 3. Inline least-privilege policy
-cat >"$TMP_DIR/inline.json" <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "ReadGlueScript",
-      "Effect": "Allow",
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::${S3_ASSET_BUCKET}/glue_jobs/*"
-    },
-    {
-      "Sid": "WriteSparkLogsTemp",
-      "Effect": "Allow",
-      "Action": "s3:PutObject",
-      "Resource": [
-        "arn:aws:s3:::${S3_ASSET_BUCKET}/spark-history/*",
-        "arn:aws:s3:::${S3_ASSET_BUCKET}/temp/*"
-      ]
-    },
-    {
-      "Sid": "IcebergDataRW",
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::${S3_WAREHOUSE_BUCKET}/*"
-    },
-    {
-      "Sid": "IcebergBucketList",
-      "Effect": "Allow",
-      "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::${S3_WAREHOUSE_BUCKET}"
-    },
-    {
-      "Sid": "GlueConnection",
-      "Effect": "Allow",
-      "Action": "glue:GetConnection",
-      "Resource": "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:connection/${GLUE_CONNECTION_NAME}"
-    },
-    {
-      "Sid": "ReadConnectionSecret",
-      "Effect": "Allow",
-      "Action": "secretsmanager:GetSecretValue",
-      "Resource": "*"
-    },
-    {
-      "Sid": "GlueDatabaseOps",
-      "Effect": "Allow",
-      "Action": ["glue:GetDatabase", "glue:CreateDatabase"],
-      "Resource": [
-        "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:catalog",
-        "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:database/archive_*"
-      ]
-    },
-    {
-      "Sid": "GlueTableOps",
-      "Effect": "Allow",
-      "Action": ["glue:GetTable", "glue:GetTables", "glue:CreateTable", "glue:UpdateTable"],
-      "Resource": [
-        "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:table/archive_*/*",
-        "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:database/archive_*",
-        "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:catalog"
-      ]
-    },
-    {
-      "Sid": "VpcEniLifecycle",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateNetworkInterface",
-        "ec2:DescribeNetworkInterfaces",
-        "ec2:DeleteNetworkInterface",
-        "ec2:AssignPrivateIpAddresses",
-        "ec2:UnassignPrivateIpAddresses"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-EOF
-
-"${AWS_CMD[@]}" iam put-role-policy \
-  --role-name "$GLUE_ROLE_NAME" \
-  --policy-name "GlueArchivalInline" \
-  --policy-document "file://$TMP_DIR/inline.json" >/dev/null
-
-echo "IAM role configured."
+echo "Existing IAM role verified."
 
 ###############################################################################
 # Upload Glue script
@@ -186,7 +81,6 @@ DEFAULT_ARGUMENTS=$(cat <<EOF
   "--TempDir": "s3://${S3_ASSET_BUCKET}/temp/",
   "--spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
   "--packages": "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.9.1",
-  "--extra-jars": "s3://${S3_ASSET_BUCKET}/glue_jobs/ojdbc8.jar",
   "--conf": "$SPARK_CONF"
 }
 EOF
@@ -223,4 +117,19 @@ else
   echo "Glue job updated."
 fi
 
-echo "Glue job deployment complete."
+echo "Glue purge job deployment complete."
+
+###############################################################################
+# Summary
+###############################################################################
+echo ""
+echo "Deployment Summary:"
+echo "Job Name: ${GLUE_JOB_NAME}"
+echo "Role: ${GLUE_ROLE_ARN} (shared with archival)"
+echo "Script: ${S3_SCRIPT_PATH}"
+echo "Connection: ${GLUE_CONNECTION_NAME}"
+echo ""
+echo "Usage:"
+echo "Discovery Mode: --mode discovery --source_name <name> --connection <conn> --iceberg_database <db>"
+echo "Delete Mode:    --mode delete --source_name <name> --connection <conn> --iceberg_database <db> --max_parallel_tables <num>"
+echo ""

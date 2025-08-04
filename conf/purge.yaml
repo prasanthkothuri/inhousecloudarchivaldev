@@ -1,0 +1,4 @@
+targets:
+  - source_name: on_prem_orcl
+    connection: onprem_orcl_conn
+

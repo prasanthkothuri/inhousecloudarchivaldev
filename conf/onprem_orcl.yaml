@@ -1,0 +1,32 @@
+env: dev
+
+connections:
+  onprem_orcl_conn: onprem_orcl_conn
+
+warehouses:
+  dev_warehouse: s3://natwest-data-archive-vault
+
+retention_policies:
+  default_6m: 6m
+
+sources:
+  - name: on_prem_orcl
+    connection: onprem_orcl_conn
+    include:
+      schemas:
+        - name: EDI_SUP_OWNER
+          tables:
+            - name: FEED
+              condition: "FEED_ID < 1000"
+            - name: FEED_BATCH
+              condition: "FEED_ID < 1000"
+            - name: FEED_PARAMETER
+              condition: "FEED_ID < 1000"
+            - name: FEED_RUN_STATUS
+              condition: "FEED_ID < 1000"
+            - name: SDAS_DOCUMENT_DETAILS_LOB  # No condition
+    exclude: {}
+
+    warehouse: dev_warehouse
+    retention_policy: default_6m
+    legal_hold: true

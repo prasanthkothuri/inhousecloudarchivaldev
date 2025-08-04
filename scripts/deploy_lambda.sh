@@ -1,214 +1,174 @@
-#!/usr/bin/env bash
+#!/bin/bash
+
 set -euo pipefail
 
-# This script deploys a given Lambda function.
-# Usage: ./deploy_lambda.sh <lambda_directory_name>
-# Example: ./deploy_lambda.sh s3_yaml_to_mwaa
-# Example: ./deploy_lambda.sh discover_tables_lambda
+# === IAM Role and Policy Configuration ===
+ACCOUNT_ID="934336705194"
+REGION="eu-west-1"
+ROLE_NAME="natwest-data-archive-discover-role"
+POLICY_NAME="natwest-data-archive-discover-policy"
+POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
+ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
-if [[ -z "$1" ]]; then
-  echo "Usage: $0 <lambda_directory_name>"
-  echo "Example: $0 s3_yaml_to_mwaa"
-  exit 1
-fi
+# === Lambda Configuration ===
+LAMBDA_NAME="natwest_data_archive_test_conn"
+LAMBDA_NAME="natwest_data_archive_discover_tables"
+ENTRY_DIR="lambda/${LAMBDA_NAME}"
+BUILD_DIR="lambda_build"
+ZIP_FILE="${LAMBDA_NAME}.zip"
+RUNTIME="python3.9"
+HANDLER="lambda_function.lambda_handler"
+TIMEOUT=30
+MEMORY_SIZE=256
+SUBNET_ID="subnet-0318c7afee7d11794"
+SECURITY_GROUP_ID="sg-097f6e3a3ad0b2721"
 
-LAMBDA_NAME=$1
+# # === Trust Policy ===
+# TRUST_POLICY=$(cat <<EOF
+# {
+#   "Version": "2012-10-17",
+#   "Statement": [{
+#     "Effect": "Allow",
+#     "Principal": { "Service": "lambda.amazonaws.com" },
+#     "Action": "sts:AssumeRole"
+#   }]
+# }
+# EOF
+# )
 
-# ---------------------------------------------------------------------------
-# Static Settings
-# ---------------------------------------------------------------------------
-AWS_REGION="eu-west-2"
-ROLE_NAME="lambda-airflow-trigger-role" # Shared role for both lambdas
-BUCKET="{s3_asset_bucket}"
-S3_PREFIX="configs/dev/archival/"
-ZIP_NAME="lambda.zip"
-MWAA_ENV_NAME="archival-dev"
-# ---------------------------------------------------------------------------
+# # === Inline IAM Policy ===
+# POLICY_DOCUMENT=$(cat <<EOF
+# {
+#   "Version": "2012-10-17",
+#   "Statement": [
+#     {
+#       "Sid": "AllowGlueConnectionAccess",
+#       "Effect": "Allow",
+#       "Action": "glue:GetConnection",
+#       "Resource": [
+#         "arn:aws:glue:${REGION}:${ACCOUNT_ID}:connection/onprem_orcl_conn",
+#         "arn:aws:glue:${REGION}:${ACCOUNT_ID}:catalog"
+#       ]
+#     },
+#     {
+#       "Sid": "AllowSecretAccess",
+#       "Effect": "Allow",
+#       "Action": "secretsmanager:GetSecretValue",
+#       "Resource": "arn:aws:secretsmanager:eu-west-1:934336705194:secret:dev/oracle/onprem_orcl-WBS9OV"
+#     },
+#     {
+#       "Sid": "AllowLogging",
+#       "Effect": "Allow",
+#       "Action": [
+#         "logs:CreateLogGroup",
+#         "logs:CreateLogStream",
+#         "logs:PutLogEvents"
+#       ],
+#       "Resource": "*"
+#     },
+#     {
+#       "Sid": "AllowEC2NI",
+#       "Effect": "Allow",
+#       "Action": [
+#         "ec2:CreateNetworkInterface",
+#         "ec2:DescribeNetworkInterfaces",
+#         "ec2:DeleteNetworkInterface"
+#       ],
+#       "Resource": "*"
+#     }
+#   ]
+# }
+# EOF
+# )
 
-# --- Dynamic Settings based on Lambda Name ---
-FUNCTION_NAME=""
-if [[ "$LAMBDA_NAME" == "s3_yaml_to_mwaa" ]]; then
-  FUNCTION_NAME="s3-yaml-to-airflow"
-elif [[ "$LAMBDA_NAME" == "discover_tables_lambda" ]]; then
-  FUNCTION_NAME="archive-discover-tables"
-else
-  echo "Error: Unknown lambda name '$LAMBDA_NAME'"
-  exit 1
-fi
-# ---
+# # === Create IAM Policy if Needed ===
+# echo "Checking if policy '${POLICY_NAME}' exists..."
+# if ! aws iam get-policy --policy-arn "${POLICY_ARN}" >/dev/null 2>&1; then
+#   echo "Creating policy '${POLICY_NAME}'..."
+#   aws iam create-policy \
+#     --policy-name "${POLICY_NAME}" \
+#     --policy-document "${POLICY_DOCUMENT}"
+#   echo "Policy created."
+# else
+#   echo "Policy '${POLICY_NAME}' already exists. Skipping creation."
+# fi
 
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-LAMBDA_DIR="$SCRIPT_DIR/../lambda/$LAMBDA_NAME"
+# # === Create IAM Role if Needed ===
+# echo "Checking if role '${ROLE_NAME}' exists..."
+# if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+#   echo "Creating role '${ROLE_NAME}'..."
+#   aws iam create-role \
+#     --role-name "$ROLE_NAME" \
+#     --assume-role-policy-document "$TRUST_POLICY" >/dev/null
+#   echo "Role created."
+# else
+#   echo "Role '${ROLE_NAME}' already exists."
+# fi
 
-# Define the AWS command as an array for robust execution
-AWS_CMD=("aws" "--region" "$AWS_REGION")
+# # === Attach Policy to Role if Not Attached ===
+# echo "Ensuring policy '${POLICY_NAME}' is attached to role..."
+# ATTACHED=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" \
+#   --query "AttachedPolicies[?PolicyName=='${POLICY_NAME}']" --output text)
+# if [[ -z "$ATTACHED" ]]; then
+#   echo "Attaching policy..."
+#   aws iam attach-role-policy \
+#     --role-name "$ROLE_NAME" \
+#     --policy-arn "$POLICY_ARN"
+# else
+#   echo "Policy already attached. Skipping."
+# fi
 
-if [[ ! -d "$LAMBDA_DIR" ]]; then
-    echo "Error: Lambda directory not found at $LAMBDA_DIR"
-    exit 1
-fi
+# # === Create Lambda Function If It Doesn't Exist ===
+# echo "Checking if Lambda '${LAMBDA_NAME}' exists..."
+# if ! aws lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+#   echo "Creating Lambda '${LAMBDA_NAME}'..."
+#   TMP_EMPTY_ZIP="empty.zip"
+#   echo "placeholder" > placeholder.txt
+#   zip -q "${TMP_EMPTY_ZIP}" placeholder.txt
+#   rm placeholder.txt
+#   aws lambda create-function \
+#     --function-name "${LAMBDA_NAME}" \
+#     --runtime "${RUNTIME}" \
+#     --role "${ROLE_ARN}" \
+#     --handler "${HANDLER}" \
+#     --timeout "${TIMEOUT}" \
+#     --memory-size "${MEMORY_SIZE}" \
+#     --zip-file "fileb://${TMP_EMPTY_ZIP}" \
+#     --region "${REGION}" \
+#     --vpc-config SubnetIds="${SUBNET_ID}",SecurityGroupIds="${SECURITY_GROUP_ID}"
+#   rm -f "${TMP_EMPTY_ZIP}"
+# else
+#   echo "Lambda '${LAMBDA_NAME}' already exists. Skipping creation."
+# fi
 
-echo "Packaging Lambda code for: $FUNCTION_NAME"
-TMP_BUILD_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_BUILD_DIR"' EXIT
+# === Build Deployment Package ===
+echo "Packaging Lambda code..."
+rm -rf "${BUILD_DIR}" "${ZIP_FILE}"
+mkdir -p "${BUILD_DIR}" "${BUILD_DIR}"/certs
+pip3 install -r "${ENTRY_DIR}/requirements.txt" \
+            --platform manylinux2014_x86_64 \
+            --python-version 3.9 \
+            --implementation cp \
+            --only-binary=:all: \
+            --upgrade -t "${BUILD_DIR}"
+cp "${ENTRY_DIR}/lambda_function.py" "${BUILD_DIR}"
+cp "${ENTRY_DIR}/ewallet.pem" "${BUILD_DIR}"/certs
+cd "${BUILD_DIR}" && zip -r "../${ZIP_FILE}" . > /dev/null && cd ..
 
-# 1. Install dependencies if requirements.txt is present
-if [[ -f "$LAMBDA_DIR/requirements.txt" ]] && [[ -s "$LAMBDA_DIR/requirements.txt" ]]; then
-  echo "Installing dependencies from requirements.txt"
-  pip install --quiet --upgrade --target "$TMP_BUILD_DIR" -r "$LAMBDA_DIR/requirements.txt"
-fi
+# === Upload Code ===
+echo "Uploading code to Lambda..."
+aws lambda update-function-code \
+  --function-name "${LAMBDA_NAME}" \
+  --zip-file "fileb://${ZIP_FILE}" \
+  --region "${REGION}"
 
-# 2. Copy Lambda handler code
-cp "$LAMBDA_DIR"/*.py "$TMP_BUILD_DIR"/
+# === Apply VPC Config Again (in case it changed) ===
+echo "Applying VPC config..."
+aws lambda update-function-configuration \
+  --function-name "${LAMBDA_NAME}" \
+  --vpc-config SubnetIds="${SUBNET_ID}",SecurityGroupIds="${SECURITY_GROUP_ID}" \
+  --region "${REGION}"
 
-# 3. Create deployment zip
-pushd "$TMP_BUILD_DIR" >/dev/null
-zip -q -r "$ZIP_NAME" ./*
-popd >/dev/null
-mv "$TMP_BUILD_DIR/$ZIP_NAME" "$LAMBDA_DIR/"
+rm -rf "${BUILD_DIR}" "${ZIP_FILE}"
 
-echo "Built $ZIP_NAME"
-
-# ---------------------------------------------------------------------------
-# 1. IAM execution role (Shared for all lambdas)
-# ---------------------------------------------------------------------------
-TRUST='{
-  "Version":"2012-10-17",
-  "Statement":[{
-    "Effect":"Allow",
-    "Principal":{"Service":"lambda.amazonaws.com"},
-    "Action":"sts:AssumeRole"
-  }]
-}'
-
-if ! "${AWS_CMD[@]}" iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-  echo "Creating shared IAM role $ROLE_NAME"
-  "${AWS_CMD[@]}" iam create-role --role-name "$ROLE_NAME" \
-       --assume-role-policy-document "$TRUST" >/dev/null
-  # Attach basic execution policy
-  "${AWS_CMD[@]}" iam attach-role-policy \
-       --role-name "$ROLE_NAME" \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-else
-  echo "Re-using shared IAM role $ROLE_NAME"
-fi
-
-# -- Grant S3 read permission (for s3_yaml_to_mwaa) --
-"${AWS_CMD[@]}" iam put-role-policy \
-  --role-name "$ROLE_NAME" \
-  --policy-name "AllowS3ReadConfig" \
-  --policy-document "{
-    \"Version\":\"2012-10-17\",
-    \"Statement\":[{
-      \"Effect\":\"Allow\",
-      \"Action\":[\"s3:GetObject\"],
-      \"Resource\":\"arn:aws:s3:::$BUCKET/$S3_PREFIX*\"
-    }]
-  }"
-
-# -- Grant MWAA CLI access (for s3_yaml_to_mwaa) --
-ACCOUNT_ID=$("${AWS_CMD[@]}" sts get-caller-identity --query Account --output text)
-MWAA_ENV_ARN="arn:aws:airflow:$AWS_REGION:$ACCOUNT_ID:environment/$MWAA_ENV_NAME"
-
-"${AWS_CMD[@]}" iam put-role-policy \
-  --role-name "$ROLE_NAME" \
-  --policy-name "AllowMWAAAccess" \
-  --policy-document "{
-    \"Version\":\"2012-10-17\",
-    \"Statement\":[{
-      \"Effect\":\"Allow\",
-      \"Action\":[\"airflow:CreateCliToken\",\"airflow:InvokeCliApi\",\"airflow:GetEnvironment\"],
-      \"Resource\":\"$MWAA_ENV_ARN\"
-    }]
-  }"
-
-# -- Grant Glue and Secrets Manager access (for discover_tables_lambda) --
-echo "Attaching policy for Glue and Secrets Manager access"
-"${AWS_CMD[@]}" iam put-role-policy \
-  --role-name "$ROLE_NAME" \
-  --policy-name "AllowGlueAndSecretsAccess" \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [
-        {
-            \"Effect\": \"Allow\",
-            \"Action\": [
-                \"glue:GetConnection\",
-                \"secretsmanager:GetSecretValue\"
-            ],
-            \"Resource\": \"*\"
-        }
-    ]
-}"
-
-ROLE_ARN=$("${AWS_CMD[@]}" iam get-role --role-name "$ROLE_NAME" \
-           --query 'Role.Arn' --output text)
-
-# ---------------------------------------------------------------------------
-# 2. Lambda function (create or update)
-# ---------------------------------------------------------------------------
-if ! "${AWS_CMD[@]}" lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
-  echo "Creating Lambda $FUNCTION_NAME"
-  "${AWS_CMD[@]}" lambda create-function \
-       --function-name "$FUNCTION_NAME" \
-       --runtime python3.12 \
-       --handler lambda_function.lambda_handler \
-       --role "$ROLE_ARN" \
-       --zip-file "fileb://$LAMBDA_DIR/$ZIP_NAME" \
-       --timeout 60
-else
-  echo "Updating Lambda code for $FUNCTION_NAME"
-  "${AWS_CMD[@]}" lambda update-function-code \
-       --function-name "$FUNCTION_NAME" \
-       --zip-file "fileb://$LAMBDA_DIR/$ZIP_NAME" >/dev/null
-fi
-
-echo "Waiting for Lambda to become active..."
-"${AWS_CMD[@]}" lambda wait function-updated --function-name "$FUNCTION_NAME"
-
-# ---------------------------------------------------------------------------
-# 3. Environment variables (Conditional)
-# ---------------------------------------------------------------------------
-if [[ "$LAMBDA_NAME" == "s3_yaml_to_mwaa" ]]; then
-    echo "Setting environment variables for $FUNCTION_NAME"
-    "${AWS_CMD[@]}" lambda update-function-configuration \
-        --function-name "$FUNCTION_NAME" \
-        --environment "Variables={APP_REGION=$AWS_REGION,MWAA_ENV_NAME=$MWAA_ENV_NAME}"
-fi
-
-
-# ---------------------------------------------------------------------------
-# 4 & 5. S3 Permissions & Trigger (ONLY for the S3 trigger lambda)
-# ---------------------------------------------------------------------------
-if [[ "$LAMBDA_NAME" == "s3_yaml_to_mwaa" ]]; then
-    echo "Configuring S3 trigger for $FUNCTION_NAME"
-    STAT_ID="s3invoke-$FUNCTION_NAME"
-    "${AWS_CMD[@]}" lambda add-permission \
-        --function-name "$FUNCTION_NAME" \
-        --statement-id "$STAT_ID" \
-        --action "lambda:InvokeFunction" \
-        --principal s3.amazonaws.com \
-        --source-arn "arn:aws:s3:::$BUCKET" 2>/dev/null || true
-
-    NOTIF=$(cat <<EOF
-{
-  "LambdaFunctionConfigurations": [{
-    "LambdaFunctionArn": "arn:aws:lambda:$AWS_REGION:$ACCOUNT_ID:function:$FUNCTION_NAME",
-    "Events": ["s3:ObjectCreated:*"],
-    "Filter": { "Key": { "FilterRules": [
-      { "Name": "prefix", "Value": "$S3_PREFIX" },
-      { "Name": "suffix", "Value": ".yaml" }
-    ]}}
-  }]
-}
-EOF
-)
-    echo "Setting bucket notification on $BUCKET"
-    "${AWS_CMD[@]}" s3api put-bucket-notification-configuration \
-        --bucket "$BUCKET" \
-        --notification-configuration "$NOTIF"
-else
-    echo "Skipping S3 trigger configuration for $FUNCTION_NAME."
-fi
-
-echo "Lambda deployed successfully."
+echo "Deployment complete."
