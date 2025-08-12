@@ -95,8 +95,9 @@ args = getResolvedOptions(
 )
 
 print(f"Starting archival for table: {args['source_schema']}.{args['source_table']}")
-if args.get("condition"):
-    print(f"Applying condition: {args['condition']}")
+condition = sys.argv[sys.argv.index("--condition") + 1] if "--condition" in sys.argv else None
+if condition:
+    print(f"Applying condition: {condition}")
 
 # --------------------------------------------------------------------------- #
 # Initialize Spark/Glue context
@@ -121,7 +122,6 @@ spark.conf.set("spark.sql.defaultCatalog", "glue_catalog")
 # --------------------------------------------------------------------------- #
 source_schema = args["source_schema"]
 source_table = args["source_table"]
-condition = args.get("condition")
 
 connection_options = {
     "useConnectionProperties": "true",
