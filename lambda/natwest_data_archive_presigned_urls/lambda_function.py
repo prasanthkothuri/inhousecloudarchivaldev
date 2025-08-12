@@ -2,14 +2,17 @@ import boto3
 import os
 from botocore.exceptions import ClientError
 import json
+import base64
+import mimetypes
 from urllib.parse import unquote
 
 def lambda_handler(event, context):
     """
-    Generates a pre-signed URL to download a file from S3.
+    Reads a file from S3, encodes it in Base64, and returns it
+    to the user for download through API Gateway.
 
-    This function is triggered by an API Gateway request. The S3 object key
-    is passed as a query string parameter named 'key'.
+    NOTE: This method is subject to a ~6MB file size limit due to
+    API Gateway payload restrictions.
     """
 
     print(f"Received event: {json.dumps(event)}")
@@ -24,38 +27,49 @@ def lambda_handler(event, context):
         }
 
     bucket_name = os.environ.get('S3_BUCKET_NAME', 'natwest-data-archive-vault')
-    expiration = 300
+    s3_region = 'eu-west-1'
     
-    # --- FIX: Explicitly define the S3 bucket's region ---
-    # This prevents any ambiguity about where the S3 client should look for the bucket.
-    s3_region = 'eu-west-1' 
-    
-    print(f"Attempting to generate URL for bucket: {repr(bucket_name)} in region: {s3_region}")
-    print(f"Attempting to generate URL for key: {repr(s3_key)}")
+    print(f"Attempting to download object from bucket: {repr(bucket_name)}, key: {repr(s3_key)}")
 
-    # Create an S3 client, specifying the region
     s3_client = boto3.client('s3', region_name=s3_region)
 
     try:
-        response = s3_client.generate_presigned_url('get_object',
-                                                    Params={'Bucket': bucket_name,
-                                                            'Key': s3_key},
-                                                    ExpiresIn=expiration)
+        # Get the object from S3
+        s3_object = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+
+        # Read the raw bytes from the file
+        file_content = s3_object['Body'].read()
+
+        # Base64 encode the bytes to safely send them through API Gateway
+        encoded_content = base64.b64encode(file_content).decode('utf-8')
+
+        # Guess the content type (e.g., 'image/jpeg', 'application/pdf') from the filename
+        content_type = mimetypes.guess_type(s3_key)[0] or 'application/octet-stream'
+
+        # Extract just the filename from the key to suggest it to the browser
+        filename = os.path.basename(s3_key)
+
     except ClientError as e:
-        print(f"Error generating pre-signed URL: {e}")
         if e.response['Error']['Code'] == 'NoSuchKey':
-             return {
+            return {
                 'statusCode': 404,
-                'body': json.dumps({'error': 'The specified file key does not exist in the bucket.'})
+                'body': json.dumps({'error': 'The specified file key does not exist.'})
             }
+        print(f"An S3 client error occurred: {e}")
         return {
             'statusCode': 500,
-            'body': json.dumps({'error': 'Could not generate the download link.'})
+            'body': json.dumps({'error': 'Could not retrieve the file from storage.'})
         }
 
+    # Return the file content directly to the user
     return {
-        'statusCode': 302,
+        'statusCode': 200,
         'headers': {
-            'Location': response
-        }
+            'Content-Type': content_type,
+            # This header tells the browser to prompt a download with the specified filename
+            'Content-Disposition': f'attachment; filename="{filename}"'
+        },
+        'body': encoded_content,
+        # This flag is crucial to tell API Gateway to decode the body before sending
+        'isBase64Encoded': True
     }
