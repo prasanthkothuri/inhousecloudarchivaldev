@@ -19,6 +19,10 @@ GLUE_SCRIPT_S3_KEY="glue_jobs/archive_table.py"
 GLUE_VERSION="5.0"
 MAX_CONCURRENCY=10
 
+# TLS truststore (you uploaded this)
+TRUSTSTORE_S3_URI="s3://${S3_ASSET_BUCKET}/glue_jobs/truststore.jks"
+TRUSTSTORE_PASSWORD="changeit"
+
 ###############################################################################
 # Helpers
 ###############################################################################
@@ -36,7 +40,6 @@ S3_SCRIPT_PATH="s3://${S3_ASSET_BUCKET}/${GLUE_SCRIPT_S3_KEY}"
 ###############################################################################
 echo "Ensuring IAM role ${GLUE_ROLE_NAME} exists ..."
 
-# 1. Trust policy
 cat >"$TMP_DIR/trust.json" <<EOF
 {
   "Version": "2012-10-17",
@@ -58,18 +61,16 @@ else
     --policy-document "file://$TMP_DIR/trust.json" >/dev/null
 fi
 
-# 2. Attach managed Glue service-role policy
 "${AWS_CMD[@]}" iam attach-role-policy \
   --role-name "$GLUE_ROLE_NAME" \
-  --policy-arn "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole" >/dev/null
+  --policy-arn "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole" >/dev/null || true
 
-# 3. Inline least-privilege policy
 cat >"$TMP_DIR/inline.json" <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "ReadGlueScript",
+      "Sid": "ReadGlueAssets",
       "Effect": "Allow",
       "Action": "s3:GetObject",
       "Resource": "arn:aws:s3:::${S3_ASSET_BUCKET}/glue_jobs/*"
@@ -160,11 +161,14 @@ echo "Uploading ${GLUE_SCRIPT_LOCAL_PATH} -> ${S3_SCRIPT_PATH}"
 ###############################################################################
 echo "Ensuring Glue job ${GLUE_JOB_NAME} exists/updated ..."
 
-SPARK_CONF="spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog \
+CONF_VALUE="spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog \
 --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog \
 --conf spark.sql.catalog.glue_catalog.warehouse=s3://${S3_WAREHOUSE_BUCKET}/iceberg/ \
 --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO \
 --conf spark.sql.defaultCatalog=glue_catalog"
+
+# Java options (spaces allowed here; Glue 5.0 accepts this argument)
+JAVA_OPTS="-Djavax.net.ssl.trustStore=/tmp/truststore.jks -Djavax.net.ssl.trustStorePassword=${TRUSTSTORE_PASSWORD} -Doracle.net.ssl_server_dn_match=true"
 
 JOB_COMMAND=$(cat <<EOF
 {
@@ -187,12 +191,14 @@ DEFAULT_ARGUMENTS=$(cat <<EOF
   "--spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
   "--packages": "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.9.1",
   "--extra-jars": "s3://${S3_ASSET_BUCKET}/glue_jobs/ojdbc8.jar",
-  "--conf": "$SPARK_CONF"
+  "--extra-files": "${TRUSTSTORE_S3_URI}",
+  "--java-options": "${JAVA_OPTS}",
+  "--conf": "${CONF_VALUE}"
 }
 EOF
 )
 
-EXECUTION_PROPERTY='{"MaxConcurrentRuns": 10}'
+EXECUTION_PROPERTY="{\"MaxConcurrentRuns\": ${MAX_CONCURRENCY}}"
 CONNECTIONS_ARG="{\"Connections\": [\"$GLUE_CONNECTION_NAME\"]}"
 
 if ! "${AWS_CMD[@]}" glue get-job --job-name "$GLUE_JOB_NAME" >/dev/null 2>&1; then

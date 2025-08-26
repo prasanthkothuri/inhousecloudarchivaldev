@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import uuid
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.decorators import task
@@ -14,6 +14,8 @@ import boto3
 # --- Constants ---
 DISCOVER_LAMBDA_FUNCTION_NAME = "natwest_data_archive_discover_tables"
 ARCHIVE_GLUE_JOB_NAME = "natwest-data-archive-table-to-iceberg"
+VALIDATE_GLUE_JOB_NAME = "natwest-archive-data-validation"
+REPORT_GENERATION_LAMBDA_NAME = "natwest_data_archive_validation_report_generation"
 ASSUME_ROLE_ARN = "arn:aws:iam::934336705194:role/DOC-Airflow-role-dev"
 DYNAMODB_TABLE_NAME = "natwest-archival-configs"
 
@@ -96,32 +98,56 @@ def parse_and_validate_config(**context):
     conf = context["dag_run"].conf
     if not conf:
         raise AirflowException("Configuration is empty. Cannot proceed.")
-    
+
     required_keys = ["env", "warehouses", "connections", "sources", "retention_policies"]
     for key in required_keys:
         if key not in conf:
             raise AirflowException(f"Missing key: '{key}'")
 
-    # env_suffix = f"_{conf['env']}"
-    # for conn_name in conf["connections"]:
-    #     if not conn_name.endswith(env_suffix):
-    #         raise AirflowException(
-    #             f"Connection '{conn_name}' missing required suffix '{env_suffix}'"
-    #         )
-
     for i, source in enumerate(conf["sources"]):
         wh = source.get("warehouse")
         if not wh or wh not in conf["warehouses"]:
             raise AirflowException(f"Source #{i}: unknown warehouse '{wh}'")
+
         conn = source.get("connection")
         if not conn or conn not in conf["connections"]:
             raise AirflowException(f"Source #{i}: unknown connection '{conn}'")
-        legal_hold = source.get("legal_hold")
-        if legal_hold is None:
-            raise AirflowException(f"Validation failed for source #{i}: 'legal_hold' is missing.")
-        if not isinstance(legal_hold, bool):
-            raise AirflowException(f"Validation failed for source #{i}: 'legal_hold' must be Boolean Value (true/false).")
 
+        legal_hold = source.get("legal_hold")
+        if legal_hold is None or not isinstance(legal_hold, bool):
+            raise AirflowException(f"Source #{i}: 'legal_hold' must be a Boolean.")
+
+        include = source.get("include", {})
+        schemas = include.get("schemas", [])
+        if not isinstance(schemas, list) or not schemas:
+            raise AirflowException(f"Source #{i}: 'include.schemas' must be a non-empty list.")
+
+        for sch in schemas:
+            if "name" not in sch:
+                raise AirflowException(f"Source #{i}: every schema requires a 'name'.")
+            tables = sch.get("tables", [])
+            if not isinstance(tables, list):
+                raise AirflowException(f"Source #{i} schema '{sch.get('name')}': 'tables' must be a list.")
+            for t in tables:
+                has_name = "name" in t and isinstance(t["name"], str) and t["name"].strip() != ""
+                has_query = "query" in t and isinstance(t["query"], str) and t["query"].strip() != ""
+                if has_name == has_query:
+                    raise AirflowException(
+                        f"Source #{i} schema '{sch['name']}': each table entry must have exactly one of "
+                        "'name' or 'query'. Entry: {t}"
+                    )
+                if has_query:
+                    # query-rules must declare where we will write in Iceberg
+                    tgt = t.get("target_table")
+                    if not tgt or not isinstance(tgt, str):
+                        raise AirflowException(
+                            f"Source #{i} schema '{sch['name']}': query entry requires 'target_table'."
+                        )
+                    if "condition" in t:
+                        raise AirflowException(
+                            f"Source #{i} schema '{sch['name']}': do not combine 'query' and 'condition'. "
+                            "Put the predicate inside the SQL."
+                        )
 
     print("Configuration validated.")
     context["ti"].xcom_push(key="validated_config", value=conf)
@@ -219,6 +245,30 @@ def invoke_discover_lambda(**context):
     print("Lambda response:", raw)
     ti.xcom_push(key="return_value", value=raw)
 
+def invoke_report_lambda(**context):
+    session = get_boto3_session()
+    lambda_client = session.client("lambda")
+
+    # Use DAG run ID or generate a UUID
+    run_id = str(uuid.uuid4())
+
+    payload = {
+        "run_id": run_id,
+        "timestamp": datetime.now().isoformat()
+    }
+
+    print(f"Invoking report generation Lambda with payload: {json.dumps(payload, indent=2)}")
+
+    response = lambda_client.invoke(
+        FunctionName=REPORT_GENERATION_LAMBDA_NAME,
+        InvocationType="RequestResponse",
+        LogType="Tail",
+        Payload=json.dumps(payload).encode("utf-8"),
+    )
+
+    raw = response["Payload"].read().decode("utf-8")
+    print("Lambda response:", raw)
+
 def prepare_glue_job_args(**context):
     ti = context["ti"]
     payload_str = ti.xcom_pull(task_ids="discover_tables_to_archive", key="return_value")
@@ -234,36 +284,55 @@ def prepare_glue_job_args(**context):
 
     config = ti.xcom_pull(task_ids="parse_and_validate_config", key="validated_config")
     source = config["sources"][0]
+
     wh_path = config["warehouses"][source["warehouse"]]
     conn_name = source["connection"]
-    conn_val = config["connections"][conn_name]
+    conn_val = config["connections"][conn_name]  # actual Glue connection name
     retention_value = config["retention_policies"][source["retention_policy"]]
     legal_hold = source['legal_hold']
 
     args = []
     for t in discovered:
-        schema = t["schema"]
-        table = t["table"]
-        condition = t.get("condition")
+        # Branch: query vs table
+        is_query = "query" in t
+        schema = t.get("schema")  # present for both kinds
+        if is_query:
+            query_sql = t["query"]
+            target_table = t["target_table"]  # required by validation
+            s3_path = f"{wh_path.rstrip('/')}/{conn_name}/{schema}/{target_table}/"
 
-        s3_path = f"{wh_path.rstrip('/')}/{conn_name}/{schema}/{table}/"
+            glue_args = {
+                "--glue_connection_name": conn_val,
+                "--source_schema": schema,
+                "--target_s3_path": s3_path,
+                "--target_glue_db": f"archive_{conn_val}",
+                "--target_glue_table": target_table,
+                "--retention_policy_value": retention_value,
+                "--legal_hold": str(legal_hold).lower(),
+                "--query": query_sql
+            }
+            # NOTE: no --source_table, no --condition in query mode
+        else:
+            table = t["table"]
+            condition = t.get("condition")
+            s3_path = f"{wh_path.rstrip('/')}/{conn_name}/{schema}/{table}/"
 
-        glue_args = {
-        "--source_schema": schema,
-        "--source_table": table,
-        "--glue_connection_name": conn_val,
-        "--target_s3_path": s3_path,
-        "--target_glue_db": f"ilm_{conn_val}",
-        "--target_glue_table": f"{schema}_{table}",
-        "--retention_policy_value": retention_value,
-        "--legal_hold": str(legal_hold).lower(),
-    }
-        if condition:
-            glue_args["--condition"] = condition
+            glue_args = {
+                "--source_schema": schema,
+                "--source_table": table,
+                "--glue_connection_name": conn_val,
+                "--target_s3_path": s3_path,
+                "--target_glue_db": f"archive_{conn_val}",
+                "--target_glue_table": f"{schema}_{table}",
+                "--retention_policy_value": retention_value,
+                "--legal_hold": str(legal_hold).lower(),
+            }
+            if condition:
+                glue_args["--condition"] = condition
 
         args.append(glue_args)
 
-    print(f"Prepared args for {len(args)} tables.")
+    print(f"Prepared args for {len(args)} items (tables and/or queries).")
     return args
 
 @task(task_id="run_archive_glue_job", max_active_tis_per_dag=2)
@@ -292,6 +361,25 @@ def run_glue_job(script_args):
         job_status = status_response["JobRun"]["JobRunState"]
         error_message = status_response["JobRun"].get("ErrorMessage", "No error message provided.")
         raise AirflowException(f"Glue job failed with status '{job_status}'. Error: {error_message}")
+
+@task(task_id="run_validate_glue_job", max_active_tis_per_dag=2)
+def run_validate_job(script_args):
+    session = get_boto3_session()
+    glue = session.client("glue")
+    print("Running Validation Glue job with args:")
+    pprint.pprint(script_args)
+    response = glue.start_job_run(JobName=VALIDATE_GLUE_JOB_NAME, Arguments=script_args)
+    job_run_id = response["JobRunId"]
+    custom_waiter = get_glue_job_run_waiter(glue)
+    print("Waiting for Validation Glue job to complete...")
+    try:
+        custom_waiter.wait(JobName=VALIDATE_GLUE_JOB_NAME, RunId=job_run_id)
+        print("Validation Glue job succeeded.")
+    except WaiterError as e:
+        status_response = glue.get_job_run(JobName=VALIDATE_GLUE_JOB_NAME, RunId=job_run_id)
+        job_status = status_response["JobRun"]["JobRunState"]
+        error_message = status_response["JobRun"].get("ErrorMessage", "No error message provided.")
+        raise AirflowException(f" Validation Glue job failed with status '{job_status}'. Error: {error_message}")
 
 # --- DAG Definition ---
 
@@ -337,4 +425,14 @@ with DAG(
         script_args=prepare_args.output
     )
 
-    print_raw_config >> validate_config >> discover_tables_to_archive >> prepare_args >> run_archive_jobs
+    run_validate_jobs = run_validate_job.expand(
+        script_args=prepare_args.output
+    )
+
+    report_generation = PythonOperator(
+    task_id="report_generation_lambda",
+    python_callable=invoke_report_lambda,
+    )
+
+
+    print_raw_config >> validate_config >> discover_tables_to_archive >> prepare_args >> run_archive_jobs >> run_validate_jobs >> report_generation
