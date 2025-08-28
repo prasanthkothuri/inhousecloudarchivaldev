@@ -6,7 +6,7 @@ from airflow.decorators import task
 from airflow.exceptions import AirflowException
 from botocore.waiter import WaiterModel, create_waiter_with_client
 from botocore.exceptions import WaiterError
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import pprint
 import boto3
@@ -245,16 +245,53 @@ def invoke_discover_lambda(**context):
     print("Lambda response:", raw)
     ti.xcom_push(key="return_value", value=raw)
 
+def aggregate_job_metadata(**context):
+    ti = context["ti"]
+
+    # Resolve LazyXComSelectSequence by converting to list
+    archive_results = ti.xcom_pull(task_ids="run_archive_glue_job", key="return_value")
+    validate_results = ti.xcom_pull(task_ids="run_validate_glue_job", key="return_value")
+
+    # Make sure they're resolved (if they're Lazy objects)
+    if not isinstance(archive_results, list):
+        archive_results = list(archive_results)
+    if not isinstance(validate_results, list):
+        validate_results = list(validate_results)
+
+    dag_run_id = context["dag_run"].run_id
+
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "airflow_run_id": dag_run_id,
+        "archive_jobs": archive_results,
+        "validate_jobs": validate_results
+    }
+
+    print("Aggregated job metadata:")
+    print("Metadata:", metadata)
+
+    # Push only JSON-serializable data
+    ti.xcom_push(key="job_metadata", value=metadata)
+
 def invoke_report_lambda(**context):
     session = get_boto3_session()
     lambda_client = session.client("lambda")
 
+    ti = context["ti"]
+
+    # Get job metadata from XCom
+    metadata = ti.xcom_pull(task_ids="aggregate_job_metadata", key="job_metadata")
+
+    if not metadata:
+        raise AirflowException("No metadata found from aggregate_job_metadata.")
+    
     # Use DAG run ID or generate a UUID
     run_id = str(uuid.uuid4())
 
     payload = {
         "run_id": run_id,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "metadata": metadata
     }
 
     print(f"Invoking report generation Lambda with payload: {json.dumps(payload, indent=2)}")
@@ -268,6 +305,7 @@ def invoke_report_lambda(**context):
 
     raw = response["Payload"].read().decode("utf-8")
     print("Lambda response:", raw)
+
 
 def prepare_glue_job_args(**context):
     ti = context["ti"]
@@ -357,10 +395,35 @@ def run_glue_job(script_args):
         print("Glue job succeeded.")
     except WaiterError as e:
         print(f"Waiter failed: {e}")
-        status_response = glue.get_job_run(JobName=ARCHIVE_GLUE_JOB_NAME, RunId=job_run_id)
-        job_status = status_response["JobRun"]["JobRunState"]
-        error_message = status_response["JobRun"].get("ErrorMessage", "No error message provided.")
-        raise AirflowException(f"Glue job failed with status '{job_status}'. Error: {error_message}")
+
+    # Get final job status and details
+    status_response = glue.get_job_run(JobName=ARCHIVE_GLUE_JOB_NAME, RunId=job_run_id)
+    job_run = status_response["JobRun"]
+    job_status = job_run["JobRunState"]
+    error_message = job_run.get("ErrorMessage", "No error message provided.")
+    start_time = job_run["StartedOn"]
+    end_time = job_run["CompletedOn"]
+    duration_timedelta = end_time - start_time
+    duration_seconds = int(duration_timedelta.total_seconds())
+    minutes, seconds = divmod(duration_seconds, 60)
+    duration = f"{minutes}m {seconds}s"
+
+    result = {
+        "job_name": ARCHIVE_GLUE_JOB_NAME,
+        "job_run_id": job_run_id,
+        "status": job_status,
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "duration_seconds": duration,
+        "script_args": script_args,
+    }
+
+    print("Job metadata:", result)
+
+    if job_status != "SUCCEEDED":
+        raise AirflowException(f"Glue job failed. Error: {error_message}")
+
+    return result
 
 @task(task_id="run_validate_glue_job", max_active_tis_per_dag=2)
 def run_validate_job(script_args):
@@ -376,11 +439,37 @@ def run_validate_job(script_args):
         custom_waiter.wait(JobName=VALIDATE_GLUE_JOB_NAME, RunId=job_run_id)
         print("Validation Glue job succeeded.")
     except WaiterError as e:
-        status_response = glue.get_job_run(JobName=VALIDATE_GLUE_JOB_NAME, RunId=job_run_id)
-        job_status = status_response["JobRun"]["JobRunState"]
-        error_message = status_response["JobRun"].get("ErrorMessage", "No error message provided.")
-        raise AirflowException(f" Validation Glue job failed with status '{job_status}'. Error: {error_message}")
+        print(f"Waiter failed: {e}")
 
+    # Get final job status and details
+    status_response = glue.get_job_run(JobName=VALIDATE_GLUE_JOB_NAME, RunId=job_run_id)
+    job_run = status_response["JobRun"]
+    job_status = job_run["JobRunState"]
+    error_message = job_run.get("ErrorMessage", "No error message provided.")
+    start_time = job_run["StartedOn"]
+    end_time = job_run["CompletedOn"]
+    duration_timedelta = end_time - start_time
+    duration_seconds = int(duration_timedelta.total_seconds())
+    minutes, seconds = divmod(duration_seconds, 60)
+    duration = f"{minutes}m {seconds}s"
+
+
+    result = {
+        "job_name": VALIDATE_GLUE_JOB_NAME,
+        "job_run_id": job_run_id,
+        "status": job_status,
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "duration_seconds": duration,
+        "script_args": script_args,
+    }
+
+    print("Validation job metadata:", result)
+
+    if job_status != "SUCCEEDED":
+        raise AirflowException(f"Validation Glue job failed. Error: {error_message}")
+
+    return result
 # --- DAG Definition ---
 
 default_args = {
@@ -429,10 +518,15 @@ with DAG(
         script_args=prepare_args.output
     )
 
+    aggregate_job_metadata_task = PythonOperator(
+    task_id="aggregate_job_metadata",
+    python_callable=aggregate_job_metadata,
+    )
+
     report_generation = PythonOperator(
     task_id="report_generation_lambda",
     python_callable=invoke_report_lambda,
     )
 
 
-    print_raw_config >> validate_config >> discover_tables_to_archive >> prepare_args >> run_archive_jobs >> run_validate_jobs >> report_generation
+    print_raw_config >> validate_config >> discover_tables_to_archive >> prepare_args >> run_archive_jobs >> run_validate_jobs >> aggregate_job_metadata_task >> report_generation   
