@@ -1,95 +1,86 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export AWS_PAGER=""
 
-# -----------------------------------------------------------------------------
-# Script: onboard_database.sh
-# Purpose: Securely create or update an AWS Glue JDBC connection + secret.
-# -----------------------------------------------------------------------------
+FILE="${1:-connections.json}"
+[ -f "$FILE" ] || { echo "Missing $FILE (pass a path or create it)"; exit 1; }
+command -v jq >/dev/null || { echo "jq is required"; exit 1; }
+command -v aws >/dev/null || { echo "aws CLI is required"; exit 1; }
 
-print_usage() {
-  cat <<EOF
-Usage: $0 --connection-name <name> --jdbc-url <url> --subnet-ids "<id1,id2>" --security-group-id <sg_id>
-  --connection-name     Unique Glue connection name (e.g. nucleus_dev)
-  --jdbc-url            Full JDBC connection string
-  --subnet-ids          Comma‑separated subnet ID list (first is used)
-  --security-group-id   Security group ID for Glue job network traffic
-EOF
-}
+echo "--- Onboarding connections from $FILE ---"
 
-# -------- Argument parsing --------
-CONNECTION_NAME=""; JDBC_URL=""; SUBNET_IDS=""; SG_ID=""
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --connection-name) CONNECTION_NAME=$2; shift 2;;
-    --jdbc-url)        JDBC_URL=$2;        shift 2;;
-    --subnet-ids)      SUBNET_IDS=$2;      shift 2;;
-    --security-group-id) SG_ID=$2;         shift 2;;
-    *) echo "Unknown flag $1"; print_usage; exit 1;;
-  esac
+jq -c '.[]' "$FILE" | while read -r row; do
+  NAME=$(jq -r '.name' <<<"$row")
+  REGION=$(jq -r '.region' <<<"$row")
+  JDBC_URL=$(jq -r '.jdbc_url' <<<"$row")
+  SUBNET_ID=$(jq -r '.subnet_id' <<<"$row")
+  SG_JSON=$(jq -c '.security_group_ids' <<<"$row")
+  ENFORCE_SSL=$(jq -r '.enforce_ssl // false' <<<"$row")    # boolean
+  SECRET_NAME=$(jq -r '.secret_name // ("glue/connections/" + .name)' <<<"$row")
+  EXTRA_PROPS=$(jq -c '.properties // {}' <<<"$row")
+  USER_ENV=$(jq -r '.username_env // empty' <<<"$row")
+  PASS_ENV=$(jq -r '.password_env // empty' <<<"$row")
+
+  AWS_CMD=(aws --region "$REGION")
+  echo ""
+  echo "==> [$REGION] $NAME"
+
+  # ---- Secret: create if missing (using env var names from JSON); otherwise reuse ----
+  if "${AWS_CMD[@]}" secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
+    echo "   Secret exists: $SECRET_NAME — reusing."
+  else
+    if [[ "$SECRET_NAME" == arn:aws:secretsmanager:* ]]; then
+      echo "   ERROR: secret ARN not found: $SECRET_NAME (cannot auto-create by ARN)"; exit 1
+    fi
+    [[ -n "$USER_ENV" && -n "$PASS_ENV" ]] || { echo "   ERROR: username_env/password_env must be set in JSON for $NAME"; exit 1; }
+    DB_USERNAME="${!USER_ENV-}"; DB_PASSWORD="${!PASS_ENV-}"
+    [[ -n "$DB_USERNAME" && -n "$DB_PASSWORD" ]] || { echo "   ERROR: env vars $USER_ENV / $PASS_ENV are not set"; exit 1; }
+
+    "${AWS_CMD[@]}" secretsmanager create-secret \
+      --name "$SECRET_NAME" \
+      --description "Credentials for Glue Connection $NAME" \
+      --secret-string "$(jq -nc --arg u "$DB_USERNAME" --arg p "$DB_PASSWORD" '{username:$u,password:$p}')" >/dev/null
+    echo "   Secret created: $SECRET_NAME"
+  fi
+
+  # ---- Build Glue connection payload (no AZ lookup) ----
+  ENF_STR=$([ "$ENFORCE_SSL" = "true" ] && echo "true" || echo "false")
+  DESC="Connection to ${NAME}"
+
+  CONN_PAYLOAD=$(jq -nc \
+    --arg name "$NAME" \
+    --arg desc "$DESC" \
+    --arg url  "$JDBC_URL" \
+    --arg sid  "$SECRET_NAME" \
+    --arg sub  "$SUBNET_ID" \
+    --arg enf  "$ENF_STR" \
+    --argjson sgs "$SG_JSON" \
+    --argjson extra "$EXTRA_PROPS" \
+    '{
+       Name:$name,
+       Description:$desc,
+       ConnectionType:"JDBC",
+       ConnectionProperties: (
+         { JDBC_CONNECTION_URL:$url,
+           SECRET_ID:$sid,
+           JDBC_ENFORCE_SSL:$enf
+         } + $extra
+       ),
+       PhysicalConnectionRequirements:{
+         SubnetId:$sub,
+         SecurityGroupIdList:$sgs
+       }
+     }')
+
+  # ---- Create if missing; skip if exists ----
+  if "${AWS_CMD[@]}" glue get-connection --name "$NAME" >/dev/null 2>&1; then
+    echo "   Glue connection '$NAME' already exists — skipping."
+  else
+    echo "   Creating Glue connection '$NAME'…"
+    "${AWS_CMD[@]}" glue create-connection --connection-input "$CONN_PAYLOAD" >/dev/null
+    echo "   Created."
+  fi
 done
 
-for var in CONNECTION_NAME JDBC_URL SUBNET_IDS SG_ID; do
-  [[ -z ${!var:-} ]] && echo "Error: $var is required." && print_usage && exit 1
-done
-
-AWS_REGION="eu-west-2"
-AWS_CMD=(aws --region "$AWS_REGION")
-SECRET_NAME="glue/connections/${CONNECTION_NAME}"
-
-# -------- Resolve primary subnet + AZ --------
-IFS=',' read -r -a SUBNET_ARRAY <<< "$SUBNET_IDS"
-PRIMARY_SUBNET="${SUBNET_ARRAY[0]}"
-AZ=$("${AWS_CMD[@]}" ec2 describe-subnets --subnet-ids "$PRIMARY_SUBNET" --query 'Subnets[0].AvailabilityZone' --output text)
-
-echo "--- Onboarding/Updating Database: $CONNECTION_NAME ---"
-
-# -------- Secret management --------
-if ! "${AWS_CMD[@]}" secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
-  read -rp "Enter database username: " DB_USERNAME
-  read -rsp "Enter database password: " DB_PASSWORD; echo
-  [[ -z $DB_USERNAME || -z $DB_PASSWORD ]] && { echo "Username/password cannot be empty"; exit 1; }
-  "${AWS_CMD[@]}" secretsmanager create-secret \
-    --name "$SECRET_NAME" \
-    --description "Credentials for Glue Connection $CONNECTION_NAME" \
-    --secret-string "$(jq -nc --arg u "$DB_USERNAME" --arg p "$DB_PASSWORD" '{username:$u,password:$p}')" >/dev/null
-  echo "✅ Secret created: $SECRET_NAME"
-else
-  echo "Secret $SECRET_NAME already exists – skipping creation."
-fi
-
-# -------- Glue connection payload --------
-CONN_PAYLOAD=$(jq -nc \
-  --arg name "$CONNECTION_NAME" \
-  --arg url  "$JDBC_URL" \
-  --arg sid  "$SECRET_NAME" \
-  --arg sub  "$PRIMARY_SUBNET" \
-  --arg sg   "$SG_ID" \
-  --arg az   "$AZ" \
-  '{
-     Name:$name,
-     Description:"Connection to \($name) DB",
-     ConnectionType:"JDBC",
-     ConnectionProperties:{
-       JDBC_CONNECTION_URL:$url,
-       SECRET_ID:$sid
-     },
-     PhysicalConnectionRequirements:{
-       SubnetId:$sub,
-       SecurityGroupIdList:[$sg],
-       AvailabilityZone:$az
-     }
-   }')
-
-CONN_UPDATE=$(jq -nc --argjson ci "$CONN_PAYLOAD" '{Name: $ci.Name, ConnectionInput:$ci}')
-
-if "${AWS_CMD[@]}" glue get-connection --name "$CONNECTION_NAME" >/dev/null 2>&1; then
-  echo "Updating existing Glue connection…"
-  "${AWS_CMD[@]}" glue update-connection --cli-input-json "${CONN_UPDATE}"
-else
-  echo "Creating new Glue connection…"
-  "${AWS_CMD[@]}" glue create-connection --connection-input "${CONN_PAYLOAD}"
-fi
-
-echo "Glue connection '$CONNECTION_NAME' configured (subnet $PRIMARY_SUBNET | AZ $AZ)."
-
-echo "--- Onboarding Complete ---"
+echo ""
+echo "--- Done. ---"

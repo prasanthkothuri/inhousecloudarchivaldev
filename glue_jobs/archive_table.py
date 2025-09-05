@@ -163,6 +163,19 @@ def _to_tcps_descriptor(simple_url: str, dn: str | None) -> str:
         f"(CONNECT_DATA=(SERVICE_NAME={service})){sec})"
     )
 
+# -------------------- NEW: DB kind detection -------------------- #
+def _db_kind_from_url(jdbc_url: str) -> str:
+    """
+    Minimal classifier so we can adjust driver and URL safely.
+    """
+    u = jdbc_url.lower()
+    if u.startswith("jdbc:oracle:"):
+        return "oracle"
+    if u.startswith("jdbc:postgresql:"):
+        return "postgres"
+    return "unknown"
+# ---------------------------------------------------------------- #
+
 # 1) Pull connection details
 glue = boto3.client("glue")
 sm = boto3.client("secretsmanager")
@@ -174,7 +187,12 @@ jdbc_url_in   = p["JDBC_CONNECTION_URL"]
 secret_arn    = p.get("SECRET_ID")
 cert_dn       = p.get("CUSTOM_JDBC_CERT_STRING")
 enforce_ssl   = (p.get("JDBC_ENFORCE_SSL", "false").lower() == "true")
-driver_class  = p.get("JDBC_DRIVER_CLASS_NAME", "oracle.jdbc.OracleDriver")
+driver_class  = p.get("JDBC_DRIVER_CLASS_NAME", None)  # allow auto-pick below
+
+# Determine DB kind so we can pick sensible defaults
+db_kind = _db_kind_from_url(jdbc_url_in)
+if not driver_class:
+    driver_class = "oracle.jdbc.OracleDriver" if db_kind == "oracle" else "org.postgresql.Driver"
 
 # 2) Resolve credentials
 if not secret_arn:
@@ -184,8 +202,19 @@ jdbc_user, jdbc_password = creds["username"], creds["password"]
 
 # 3) SSL / URL handling
 # Truststore is provided at job level via Extra file + spark.*.extraJavaOptions.
-jdbc_url = _to_tcps_descriptor(jdbc_url_in, cert_dn if enforce_ssl else None)
-print(f"Using JDBC URL (descriptor): {jdbc_url[:200]}{'...' if len(jdbc_url) > 200 else ''}")
+jdbc_url = jdbc_url_in
+
+if db_kind == "oracle":
+    # Upgrade thin URL to TCPS descriptor when SSL is enforced
+    jdbc_url = _to_tcps_descriptor(jdbc_url_in, cert_dn if enforce_ssl else None)
+elif db_kind == "postgres":
+    # If SSL is enforced and URL lacks sslmode, append the usual bits
+    if enforce_ssl and ("sslmode=" not in jdbc_url_in.lower()):
+        sep = "&" if "?" in jdbc_url_in else "?"
+        jdbc_url = jdbc_url_in + f"{sep}ssl=true&sslmode=require"
+
+print(f"[DB={db_kind}] Using JDBC URL: {jdbc_url[:200]}{'...' if len(jdbc_url) > 200 else ''}")
+print(f"[DB={db_kind}] Driver class: {driver_class}")
 
 # 4) Build the DataFrame reader (supports inline SQL dbtable)
 reader = (
@@ -195,8 +224,14 @@ reader = (
          .option("user", jdbc_user)
          .option("password", jdbc_password)
          .option("fetchsize", "10000")
-         .option("oracle.jdbc.defaultLobPrefetchSize", "104857600")
 )
+
+# Keep your Oracle optimization; add a small PG tweak
+if db_kind == "oracle":
+    reader = reader.option("oracle.jdbc.defaultLobPrefetchSize", "104857600")
+elif db_kind == "postgres":
+    # Helps with some type inference edge cases
+    reader = reader.option("stringtype", "unspecified")
 
 schema_name = args["source_schema"]
 
