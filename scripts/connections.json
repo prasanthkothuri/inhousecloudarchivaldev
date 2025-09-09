@@ -1,0 +1,28 @@
+[
+  {
+    "name": "pg_doc_db_metadata_conn",
+    "region": "eu-west-1",
+    "jdbc_url": "jdbc:postgresql://doc-mde-rds.dev01-pcf.shared.banksvcs.net:5432/doc_db_metadata?sslmode=require",
+    "subnet_id": "subnet-0318c7afee7d11794",
+    "security_group_ids": ["sg-08dd5e67c583c19d", "sg-097f6e3a3ad0b2721"],
+    "enforce_ssl": true,
+    "secret_name": "glue/connections/pg_doc_db_metadata_conn",
+    "username_env": "PG_DOC_SUPPORT_USER",
+    "password_env": "PG_DOC_SUPPORT_PASS"
+  },
+  {
+    "name": "onprem_orcl_conn",
+    "region": "eu-west-1",
+    "jdbc_url": "jdbc:oracle:thin:@//devecpvm020400.server.banksvcs.net:1799/DOGB3335_APP",
+    "subnet_id": "subnet-0318c7afee7d11794",
+    "security_group_ids": ["sg-097f6e3a3ad0b2721", "sg-08dd5e67c583c19d"],
+    "enforce_ssl": true,
+    "secret_name": "arn:aws:secretsmanager:eu-west-1:934336705194:secret:dev/oracle/onprem_orcl-WBS9OV",
+    "properties": {
+      "JDBC_DRIVER_CLASS_NAME": "oracle.jdbc.driver.OracleDriver",
+      "JDBC_DRIVER_JAR_URI": "s3://natwest-data-archive-assets/glue_jobs/ojdbc8.jar",
+      "CUSTOM_JDBC_CERT": "s3://natwest-data-archive-assets/glue_jobs/infa_truststore.pem",
+      "CUSTOM_JDBC_CERT_STRING": "CN=DataOrchestrationAWS_NFT, OU=Devices, OU=Proving G1 PKI Service, O=The Royal Bank of Scotland Group"
+    }
+  }
+]

@@ -495,10 +495,10 @@ with DAG(
         python_callable=parse_and_validate_config,
     )
 
-    # store_config = PythonOperator(
-    #     task_id="store_config_in_dynamodb",
-    #     python_callable=store_config_in_dynamodb,
-    # )
+    store_config = PythonOperator(
+        task_id="store_config_in_dynamodb",
+        python_callable=store_config_in_dynamodb,
+    )
 
     discover_tables_to_archive = PythonOperator(
         task_id="discover_tables_to_archive",
@@ -528,5 +528,5 @@ with DAG(
     python_callable=invoke_report_lambda,
     )
 
+    print_raw_config >> validate_config >> discover_tables_to_archive >> store_config >> prepare_args >> run_archive_jobs >> run_validate_jobs >> aggregate_job_metadata_task >> report_generation   
 
-    print_raw_config >> validate_config >> discover_tables_to_archive >> prepare_args >> run_archive_jobs >> run_validate_jobs >> aggregate_job_metadata_task >> report_generation   
