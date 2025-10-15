@@ -292,7 +292,7 @@ def grant_permissions(
 ) -> None:
     existing = lakeformation_client.list_permissions(
         Principal={"DataLakePrincipalIdentifier": principal_arn},
-        ResourceType=next(iter(resource)),
+        Resource=resource,
     )
 
     desired_permissions = set(permissions)
