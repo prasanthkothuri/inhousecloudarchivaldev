@@ -62,3 +62,14 @@ This will:
 
 - Create a secret in AWS Secrets Manager for DB credentials
 - Create or update a Glue connection with VPC and networking details
+
+## Lake Formation Governance
+Run `scripts/manage_lakeformation_governance.py` to register archive storage with Lake Formation, tag the Glue catalog entries, and grant consumer access:
+
+```bash
+./scripts/manage_lakeformation_governance.py \
+  --bucket my-archive-bucket \
+  --prefix warehouse/prod \
+  --glue-database archive_orders \
+  --consumer-role-arn arn:aws:iam::111122223333:role/data-analytics-readonly
+```
