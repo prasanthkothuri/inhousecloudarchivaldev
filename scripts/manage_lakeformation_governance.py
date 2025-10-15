@@ -170,11 +170,12 @@ def ensure_resource_registered(
     use_service_linked_role: bool,
 ) -> None:
     LOGGER.info("Ensuring Lake Formation resource is registered: %s", resource_arn)
-    describe_kwargs = {"ResourceArn": resource_arn, "MaxResults": 1}
-    existing = lakeformation_client.describe_resources(**describe_kwargs).get("ResourceInfoList", [])
-    if existing:
+    try:
+        lakeformation_client.describe_resource(ResourceArn=resource_arn)
         LOGGER.info("Resource already registered; skipping.")
         return
+    except lakeformation_client.exceptions.EntityNotFoundException:
+        LOGGER.info("Resource not yet registered; proceeding.")
 
     register_kwargs = {"ResourceArn": resource_arn}
     if assume_role_arn:
