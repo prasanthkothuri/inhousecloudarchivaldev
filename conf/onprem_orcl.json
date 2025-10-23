@@ -36,7 +36,10 @@
             "exclude": {},
             "warehouse": "dev_warehouse",
             "retention_policy": "default_6m",
-            "legal_hold": false
+            "legal_hold": false,
+            "consumer_roles": [
+                "arn:aws:iam::934336705194:role/ADFS-DOC-DOGB333"
+            ]
         }
     ]
 }

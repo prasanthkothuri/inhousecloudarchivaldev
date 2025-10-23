@@ -117,6 +117,20 @@ def parse_and_validate_config(**context):
         if legal_hold is None or not isinstance(legal_hold, bool):
             raise AirflowException(f"Source #{i}: 'legal_hold' must be a Boolean.")
 
+        consumer_roles = source.get("consumer_roles")
+        if consumer_roles is not None:
+            if not isinstance(consumer_roles, list) or not consumer_roles:
+                raise AirflowException(
+                    f"Source #{i}: 'consumer_roles' must be a non-empty list when provided."
+                )
+            invalid_roles = [
+                role for role in consumer_roles if not isinstance(role, str) or not role.strip()
+            ]
+            if invalid_roles:
+                raise AirflowException(
+                    f"Source #{i}: 'consumer_roles' entries must be non-empty strings."
+                )
+
         include = source.get("include", {})
         schemas = include.get("schemas", [])
         if not isinstance(schemas, list) or not schemas:
@@ -529,4 +543,3 @@ with DAG(
     )
 
     print_raw_config >> validate_config >> discover_tables_to_archive >> store_config >> prepare_args >> run_archive_jobs >> run_validate_jobs >> aggregate_job_metadata_task >> report_generation   
-
