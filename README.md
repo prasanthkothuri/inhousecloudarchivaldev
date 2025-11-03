@@ -64,12 +64,56 @@ This will:
 - Create or update a Glue connection with VPC and networking details
 
 ## Lake Formation Governance
-Run `scripts/manage_lakeformation_governance.py` to register archive storage with Lake Formation, tag the Glue catalog entries, and grant consumer access:
+
+Lake Formation policies keep archived data controlled while allowing downstream read-only access.
+
+### 1. One-time resource registration
+
+Register the archive prefix (or the whole bucket) with Lake Formation so data lake admins can manage anything stored beneath it:
 
 ```bash
-./scripts/manage_lakeformation_governance.py \
-  --bucket my-archive-bucket \
-  --prefix warehouse/prod \
-  --glue-database archive_orders \
-  --consumer-role-arn arn:aws:iam::111122223333:role/data-analytics-readonly
+aws lakeformation register-resource \
+  --region eu-west-1 \
+  --use-service-linked-role \
+  --resource-arn arn:aws:s3:::natwest-data-archive-vault/iceberg
 ```
+
+### 2. Per archive database
+
+For every Glue database produced by an archival run (for example `archive_onprem_orcl_conn`, `archive_bizops_orcl_conn`):
+
+```bash
+# Ensure OpsAdmin stays a LF admin and grant DESCRIBE on the catalog
+python3 ./scripts/manage_lakeformation_governance.py \
+  --bucket natwest-data-archive-vault \
+  --prefix iceberg \
+  --glue-database <archive_db_name> \
+  --consumer-role-arn arn:aws:iam::934336705194:role/ADFS-DOC-DOGB333 \
+  --permissions DESCRIBE \
+  --data-lake-admin-arns arn:aws:iam::934336705194:role/ADFS-DOC-OpsAdminRole
+
+# Allow the consumer role to query every table in that Glue database
+aws lakeformation grant-permissions \
+  --region eu-west-1 \
+  --principal DataLakePrincipalIdentifier=arn:aws:iam::934336705194:role/ADFS-DOC-DOGB333 \
+  --resource '{"Table":{"CatalogId":"934336705194","DatabaseName":"<archive_db_name>","TableWildcard":{}}}' \
+  --permissions SELECT
+```
+
+### 3. Verification
+
+Confirm the permissions after each run:
+
+```bash
+aws lakeformation list-permissions \
+  --region eu-west-1 \
+  --principal DataLakePrincipalIdentifier=arn:aws:iam::934336705194:role/ADFS-DOC-DOGB333 \
+  --resource '{"Database":{"CatalogId":"934336705194","Name":"<archive_db_name>"}}'
+
+aws lakeformation list-permissions \
+  --region eu-west-1 \
+  --principal DataLakePrincipalIdentifier=arn:aws:iam::934336705194:role/ADFS-DOC-DOGB333 \
+  --resource '{"Table":{"CatalogId":"934336705194","DatabaseName":"<archive_db_name>","TableWildcard":{}}}'
+```
+
+These steps keep `arn:aws:iam::934336705194:role/ADFS-DOC-OpsAdminRole` as the data lake administrator for the archive while limiting `arn:aws:iam::934336705194:role/ADFS-DOC-DOGB333` to read-only access on the target database.
