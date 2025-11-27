@@ -4,34 +4,136 @@ A complete archival pipeline to offload aged tables from relational databases to
 
 ## Project Structure
 
+```
+.
+├── airflow/
+│   └── dags/
+│       ├── natwest_data_archival_to_iceberg.py
+│       └── natwest_data_purge_from_iceberg.py
+├── conf/                    # Configuration files
+├── glue_jobs/
+│   ├── archive_table.py     # Archive tables to Iceberg
+│   ├── purge_table.py       # Purge tables from Iceberg
+│   └── validate_table.py    # Validate archived data
+├── lambda/
+│   ├── natwest_data_archive_discover_tables/
+│   ├── natwest_data_archive_presigned_urls/
+│   ├── natwest_data_archive_test_conn/
+│   ├── natwest_data_archive_validation_report_generation/
+│   └── s3_yaml_to_mwaa/
+├── scripts/
+│   ├── deploy.sh
+│   ├── deploy_glue.sh
+│   ├── deploy_lambda.sh
+│   ├── deploy_mwaa.sh
+│   ├── deploy_purge_glue.sh
+│   ├── onboard_database.sh
+│   └── manage_lakeformation_governance.py
+├── utils/
+│   └── delete_iceberg_db.sh
+└── README.md
+```
+
 
 ## What It Does
 
 - Discovers tables in source databases that match a retention policy.
 - Offloads tables to Iceberg format using AWS Glue with full lineage.
+- Validates archived data integrity through comparison checks.
+- Purges data from Iceberg archives when needed.
 - Automates orchestration via Apache Airflow running on MWAA.
+- Stores configuration in DynamoDB for dynamic workflow management.
 - Supports onboarding of new databases via simple YAML config.
 - Deployable via a single script (`scripts/deploy.sh`).
 
 ## Components
 
-### 1. Glue Job
+### 1. Glue Jobs
 
+#### Archive Job
 - Script: `glue_jobs/archive_table.py`
-- Copies tables to Iceberg format in S3.
-- Uses JDBC connection and Secrets Manager for authentication.
-- Automatically creates Glue metadata (catalog, database, tables).
+- Job name: `natwest-data-archive-table-to-iceberg`
+- Copies tables to Iceberg format in S3
+- Uses JDBC connection and Secrets Manager for authentication
+- Automatically creates Glue metadata (catalog, database, tables)
 
-### 2. Airflow DAG
+#### Validation Job
+- Script: `glue_jobs/validate_table.py`
+- Job name: `natwest-archive-data-validation`
+- Validates data integrity between source and archived tables
+- Compares row counts and sample data checksums
 
-- File: `airflow/dags/archive_tables.py`
-- Discovers eligible tables and launches per-table offload Glue jobs.
+#### Purge Job
+- Script: `glue_jobs/purge_table.py`
+- Job name: `natwest-data-purge-from-iceberg`
+- Removes tables from Iceberg catalog and S3 storage
+- Cleans up metadata and physical files
+
+### 2. Airflow DAGs
+
+#### Archival DAG
+- File: `airflow/dags/natwest_data_archival_to_iceberg.py`
+- Discovers eligible tables via Lambda
+- Launches archive Glue jobs per table
+- Runs validation after archival
+- Generates validation reports
+
+#### Purge DAG
+- File: `airflow/dags/natwest_data_purge_from_iceberg.py`
+- Orchestrates purging of archived tables from Iceberg
+- Triggered via Airflow API or configuration
 
 ### 3. Lambda Functions
 
-- `discover_tables_lambda`: Finds archival candidates and triggers DAG runs.
-- `s3_yaml_to_mwaa`: Triggers DAGs on YAML upload to S3.
-- Both share an IAM role and are packaged using `scripts/deploy_lambda.sh`.
+#### Discovery Lambda
+- Function: `natwest_data_archive_discover_tables`
+- Finds archival candidates based on retention policies
+- Queries DynamoDB for configuration
+- Triggers archival DAG runs
+
+#### S3 YAML Trigger
+- Function: `s3_yaml_to_mwaa`
+- Triggers DAGs when YAML configs are uploaded to S3
+- Enables configuration-driven workflows
+
+#### Connection Tester
+- Function: `natwest_data_archive_test_conn`
+- Tests database connectivity before archival
+- Validates JDBC connections and credentials
+
+#### Presigned URL Generator
+- Function: `natwest_data_archive_presigned_urls`
+- Generates temporary S3 URLs for archived data access
+- Provides secure time-limited access to archive files
+
+#### Validation Report Generator
+- Function: `natwest_data_archive_validation_report_generation`
+- Aggregates validation results
+- Creates comprehensive validation reports
+
+### 4. DynamoDB Configuration
+
+- Table: `natwest-archival-configs`
+- Stores archival configurations dynamically
+- Contains database connection details, retention policies, and scheduling information
+- Enables runtime configuration without code changes
+
+## Workflows
+
+### Archival Workflow
+
+1. **Discovery**: Lambda function queries DynamoDB and source databases for eligible tables
+2. **Triggering**: Lambda triggers the archival DAG in MWAA
+3. **Archival**: DAG spawns Glue jobs per table to copy data to Iceberg format
+4. **Validation**: After archival, validation Glue job compares source and archive
+5. **Reporting**: Validation report Lambda generates summary reports
+
+### Purge Workflow
+
+1. **Trigger**: Purge DAG is triggered manually or via configuration
+2. **Execution**: Purge Glue job removes tables from Iceberg catalog
+3. **Cleanup**: Physical files are deleted from S3 storage
+4. **Verification**: Metadata is cleaned up from Glue catalog
 
 ## Deployment
 
@@ -44,11 +146,18 @@ Run the main deployment script:
 This will:
 
 - Upload Airflow DAGs to S3
-- Deploy required Lambda functions
-- Set up and upload the Glue job
+- Deploy all Lambda functions
+- Set up and upload all Glue jobs (archive, validate, purge)
 - Optionally deploy MWAA infrastructure (can be uncommented in deploy.sh)
 
+Individual deployment scripts:
+- `scripts/deploy_glue.sh` - Deploy archive and validation Glue jobs
+- `scripts/deploy_purge_glue.sh` - Deploy purge Glue job
+- `scripts/deploy_lambda.sh` - Deploy all Lambda functions
+- `scripts/deploy_mwaa.sh` - Deploy MWAA environment
+
 ## Onboard a New Database
+
 Use the following script to register a new JDBC database:
 
 ```bash
@@ -58,10 +167,25 @@ Use the following script to register a new JDBC database:
   --subnet-ids "subnet-abc,subnet-def" \
   --security-group-id sg-xyz
 ```
-This will:
 
+This will:
 - Create a secret in AWS Secrets Manager for DB credentials
 - Create or update a Glue connection with VPC and networking details
+- Configure the connection for use by Glue jobs
+
+## Utilities
+
+### Delete Iceberg Database
+Remove an entire Iceberg database and its contents:
+
+```bash
+./utils/delete_iceberg_db.sh <database-name>
+```
+
+This utility:
+- Drops the specified Glue database
+- Cleans up associated S3 data
+- Removes catalog metadata
 
 ## Lake Formation Governance
 
